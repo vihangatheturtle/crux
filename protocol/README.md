@@ -1,10 +1,7 @@
 # Crux Protocol
 The Crux Protocol is a trust-less information transfer (more specifically: websites) protocol. The protocol operates with similar concepts to that of onion routing. Crux Protocol ensures information that is relayed from the client to the webserver is completely oblivious to routing nodes in the connection "tunnel", this allows for enhanced privacy for the client. The Crux Protocol aims to be faster and more private than onion routing.
 
-**Contents**
- - [Starting a connection](#start-a-connection)
-
-## Starting a connection {#start-a-connection}
+## Starting a connection
 When a connection (to a webserver) is requested, the client picks a random known node to check if it has the IP address to the remote server, if it does not, this process will repeat until a node which knows an IP address matching the server's public key is found; this node is called the "final node".
 
 At this point, the client will pick 6 random nodes and assign them a random order with the node which already knows the IP of the server being appended on the end. 
