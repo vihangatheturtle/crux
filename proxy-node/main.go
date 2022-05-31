@@ -83,7 +83,7 @@ func main() {
 				k[i] = s
 				i++
 			}
-			if contains(k, "_crux_body_encrypted") {
+			if contains(k, "_crux_request_encrypted") {
 				// Decrypt layer
 			}
 		}
