@@ -4,7 +4,7 @@ The Crux Protocol is a trust-less information transfer (more specifically: websi
 ## Starting a connection
 When a connection (to a webserver) is requested, the client picks a random known node to check if it has the IP address to the remote server, if it does not, this process will repeat until a node which knows an IP address matching the server's public key is found; this node is called the "final node".
 
-At this point, the client will pick 6 random nodes and assign them a random order with the node which already knows the IP of the server being appended on the end. The client will sign the message, encrypt the message with the webserver's public key and then will use each of the tunnel node's public keys in the reverse order to "wrap" the message with a layers of encryption, similar to onion routing.
+At this point, the client will pick 6 random nodes and assign them a random order with the node which already knows the IP of the server being appended on the end. The client will sign the message, encrypt the message with the webserver's public key and then will use each of the tunnel node's public keys in the reverse order to "wrap" the message with layers of encryption (one for each node), similar to onion routing.
 
 A HTTP request is sent to the tunnel, starting with the first node and ending with the final node. Each node will decrypt the request with their private key and forward to the next node in the tunnel.
 
