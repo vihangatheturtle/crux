@@ -142,11 +142,11 @@ func propagateCommand(text string) {
 
 	log.Println("Propagating command "+strings.Split(text, "::")[0]+" to", len(nodesList), "nodes")
 
-	for _, node := range known {
-		data, _ := node.(map[string]interface{})
+	for _, validator := range known {
+		data, _ := validator.(map[string]interface{})
 		conn, err := net.Dial("tcp", data["IP"].(string)+":"+data["PORT"].(string))
 		if err != nil {
-			log.Fatal("Couldnt propagate command to node: "+data["PUBKEY"].(string)+",", err)
+			log.Fatal("Couldnt propagate command to validator: "+data["PUBKEY"].(string)+",", err)
 		}
 		log.Println("Sending to " + data["IP"].(string) + ":" + data["PORT"].(string))
 		fmt.Fprintf(conn, text+"\n")
@@ -319,23 +319,6 @@ func shutDownTCP() {
 	}
 }
 
-func handleConn(conn net.Conn) {
-	defer conn.Close()
-
-	for {
-		netData, err := bufio.NewReader(conn).ReadString('\n')
-		if err != nil {
-			fmt.Println(err)
-			return
-		}
-
-		temp := strings.TrimSpace(string(netData))
-		if strings.Split(temp, "::")[0] == "REGISTER_NODE" || strings.Split(temp, "::")[0] == "REGISTER_NODE_PROPAGATE" {
-			// TODO: register node and propagate to other nodes
-		}
-	}
-}
-
 func startTCPServer() {
 	// start TCP and serve TCP server
 	p2pPort, _ := strconv.Atoi(port)
@@ -366,16 +349,14 @@ func startTCPServer() {
 
 func registerWithPeers() {
 	log.Println("Registering with peer nodes")
-	originAddr := "localhost:8080"
+	originAddr := "localhost:8081"
 
 	c, err := getConn(originAddr)
 
 	if err != nil {
 		log.Fatal("INITIAL NODE OFFLINE:", err)
 	} else {
-		pubkey := privateKey.PublicKey
-		pubKeyMarshal, _ := ExportRsaPublicKeyAsPemStr(&pubkey)
-		fmt.Fprintf(c, "REGISTER_NODE::0.0.0.0::"+port+"::"+pubKeyMarshal+"::"+signMessage(publicKey, privateKey)+"\n")
+		fmt.Fprintf(c, "REGISTER_NODE::0.0.0.0::"+port+"::"+publicKey+"::"+signMessage(publicKey, privateKey)+"\n")
 
 		raw, _ := bufio.NewReader(c).ReadString('\n')
 		message := strings.Split(raw, "\n")[0]
@@ -388,7 +369,7 @@ func registerWithPeers() {
 				"PORT":   strings.Split(originAddr, ":")[1],
 				"PUBKEY": message,
 			}
-			log.Println("Node registered with initial node")
+			log.Println("Validator registered with initial node")
 			log.Println("Network propagation is in progress this may take up to an hour")
 		} else {
 			if stype != "origin" {
