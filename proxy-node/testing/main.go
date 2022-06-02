@@ -13,7 +13,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"net"
@@ -28,6 +30,7 @@ import (
 
 var nodesList = make(map[string]interface{})
 var privateKey *rsa.PrivateKey
+var originAddr string
 var publicKey string
 var stype string
 var port string
@@ -142,11 +145,11 @@ func propagateCommand(text string) {
 
 	log.Println("Propagating command "+strings.Split(text, "::")[0]+" to", len(nodesList), "nodes")
 
-	for _, validator := range known {
-		data, _ := validator.(map[string]interface{})
+	for _, node := range known {
+		data, _ := node.(map[string]interface{})
 		conn, err := net.Dial("tcp", data["IP"].(string)+":"+data["PORT"].(string))
 		if err != nil {
-			log.Fatal("Couldnt propagate command to validator: "+data["PUBKEY"].(string)+",", err)
+			log.Fatal("Couldnt propagate command to node: "+data["PUBKEY"].(string)+",", err)
 		}
 		log.Println("Sending to " + data["IP"].(string) + ":" + data["PORT"].(string))
 		fmt.Fprintf(conn, text+"\n")
@@ -180,6 +183,7 @@ func main() {
 	killServer = false
 	stype = os.Getenv("TYPE")
 	port = os.Getenv("PORT")
+	originAddr = os.Getenv("ORIGIN_ADDR")
 	proxy := goproxy.NewProxyHttpServer()
 	proxy.Verbose = true
 	proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)
@@ -308,7 +312,7 @@ func main() {
 	time.Sleep(time.Second)
 	go startTCPServer()
 	go registerWithPeers()
-	proxySrv = &http.Server{Addr: ":" + port, Handler: proxy}
+	proxySrv = &http.Server{Addr: "0.0.0.0:" + port, Handler: proxy}
 	proxySrv.ListenAndServe()
 }
 
@@ -319,12 +323,78 @@ func shutDownTCP() {
 	}
 }
 
+func ParseRsaPublicKeyFromPemStr(pubPEM string) (*rsa.PublicKey, error) {
+	block, _ := pem.Decode([]byte(pubPEM))
+	if block == nil {
+		return nil, errors.New("failed to parse PEM block containing the key")
+	}
+
+	pub, err := x509.ParsePKIXPublicKey(block.Bytes)
+	if err != nil {
+		return nil, err
+	}
+
+	switch pub := pub.(type) {
+	case *rsa.PublicKey:
+		return pub, nil
+	default:
+		break // fall through
+	}
+	return nil, errors.New("key type is not RSA")
+}
+
+func handleConn(conn net.Conn) {
+	defer conn.Close()
+
+	for {
+		netData, err := bufio.NewReader(conn).ReadString('\n')
+		if err != nil {
+			log.Println(err)
+			return
+		}
+
+		temp := strings.TrimSpace(string(netData))
+		if strings.Split(temp, "::")[0] == "REGISTER_NODE" || strings.Split(temp, "::")[0] == "REGISTER_NODE_PROPAGATE" {
+			var err error
+
+			nodePort := strings.Split(temp, "::")[1]
+			nodePubk := strings.Split(temp, "::")[2]
+			log.Println(strings.Split(temp, "::"))
+			nodeSign, err := hex.DecodeString(strings.ReplaceAll(strings.Split(temp, "::")[3], "NEWLINEBREAK", "\n"))
+			if err != nil {
+				log.Println("could not decode signature: ", err)
+				io.WriteString(conn, "ERROR::SIGNATURE_DECODE_FAILED\n")
+			}
+
+			hasher := sha256.New()
+			hasher.Write([]byte(nodePubk))
+			hashSum := hasher.Sum(nil)
+
+			nodePubKey, err := ParseRsaPublicKeyFromPemStr(nodePubk)
+			if err != nil {
+				log.Println("could not parse public key: ", err)
+				io.WriteString(conn, "ERROR::PUBKEY_PARSE_FAILED\n")
+			}
+
+			err = rsa.VerifyPSS(nodePubKey, crypto.SHA256, hashSum, nodeSign, nil)
+			if err != nil {
+				log.Println("could not verify signature: ", err)
+				io.WriteString(conn, "ERROR::INVALID_SIGNATURE\n")
+				return
+			}
+
+			log.Println("Registering node on port", nodePort)
+			// TODO: register node and propagate to other nodes
+		}
+	}
+}
+
 func startTCPServer() {
 	// start TCP and serve TCP server
 	p2pPort, _ := strconv.Atoi(port)
 	p2pPort += 1
 	p2pPortStr := strconv.Itoa(p2pPort)
-	tcpSrv, err := net.Listen("tcp", ":"+p2pPortStr)
+	tcpSrv, err := net.Listen("tcp", "0.0.0.0:"+p2pPortStr)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -339,8 +409,7 @@ func startTCPServer() {
 			if err != nil {
 				log.Fatal(err)
 			}
-			log.Println(conn)
-			//go handleConn(conn)
+			go handleConn(conn)
 		} else {
 			break
 		}
@@ -349,14 +418,25 @@ func startTCPServer() {
 
 func registerWithPeers() {
 	log.Println("Registering with peer nodes")
-	originAddr := "localhost:8081"
+	if originAddr == "" {
+		log.Println("No origin address specified")
+		if stype != "origin" {
+			shutDownTCP()
+			killServer = true
+		} else {
+			log.Println("Ignoring error, already running as an origin node")
+		}
+		return
+	}
 
 	c, err := getConn(originAddr)
 
-	if err != nil {
-		log.Fatal("INITIAL NODE OFFLINE:", err)
+	if err != nil && stype != "origin" {
+		log.Println("INITIAL NODE OFFLINE:", err)
 	} else {
-		fmt.Fprintf(c, "REGISTER_NODE::0.0.0.0::"+port+"::"+publicKey+"::"+signMessage(publicKey, privateKey)+"\n")
+		pubkey := privateKey.PublicKey
+		pubKeyMarshal, _ := ExportRsaPublicKeyAsPemStr(&pubkey)
+		fmt.Fprintf(c, "REGISTER_NODE::"+port+"::"+strings.ReplaceAll(pubKeyMarshal, "\n", "NEWLINEBREAK")+"::"+signMessage(pubKeyMarshal, privateKey)+"\n")
 
 		raw, _ := bufio.NewReader(c).ReadString('\n')
 		message := strings.Split(raw, "\n")[0]
@@ -369,7 +449,7 @@ func registerWithPeers() {
 				"PORT":   strings.Split(originAddr, ":")[1],
 				"PUBKEY": message,
 			}
-			log.Println("Validator registered with initial node")
+			log.Println("Node registered with initial node")
 			log.Println("Network propagation is in progress this may take up to an hour")
 		} else {
 			if stype != "origin" {
