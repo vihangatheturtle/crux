@@ -343,49 +343,126 @@ func ParseRsaPublicKeyFromPemStr(pubPEM string) (*rsa.PublicKey, error) {
 	return nil, errors.New("key type is not RSA")
 }
 
+func propagateNewNode(text string, filter string) {
+	known := nodesList
+
+	log.Println("Starting network-wide node propagation")
+	if !strings.Contains(text, "_PROPAGATE") {
+		text = strings.Replace(text, "REGISTER_NODE", "REGISTER_NODE_PROPAGATE", -1)
+	}
+	if len(strings.Split(text, "::")) == 4 {
+		text = text + "::" + strings.Split(filter, ":")[0]
+	}
+	for _, node := range known {
+		valid := true
+		data, _ := node.(map[string]interface{})
+		if (data["IP"].(string) + ":" + data["PORT"].(string)) == filter {
+			valid = false
+		}
+		if valid {
+			conn, err := net.Dial("tcp", data["IP"].(string)+":"+data["PORT"].(string))
+			if err != nil {
+				log.Fatal("Couldnt propagate new node to node: "+data["PUBKEY"].(string)+",", err)
+			}
+			log.Println("Sending to " + data["IP"].(string) + ":" + data["PORT"].(string) + ": " + text)
+			fmt.Fprintf(conn, text+"\n")
+			raw, _ := bufio.NewReader(conn).ReadString('\n')
+			message := strings.Split(raw, "\n")[0]
+			if message == "NODE_REGISTERED" {
+				log.Println("Forwarded node registration to " + data["IP"].(string) + ":" + data["PORT"].(string) + ": " + message)
+			}
+		} else {
+			log.Println("Skipped node " + data["IP"].(string) + ":" + data["PORT"].(string) + " due to broadcast filter")
+		}
+	}
+}
+
 func handleConn(conn net.Conn) {
 	defer conn.Close()
 
-	for {
-		netData, err := bufio.NewReader(conn).ReadString('\n')
-		if err != nil {
-			log.Println(err)
+	if addr, ok := conn.RemoteAddr().(*net.TCPAddr); ok {
+		nodeIP := addr.IP.String()
+		log.Println("New connection from " + nodeIP)
+		if strings.Contains(nodeIP, ":") {
+			log.Println("Denied connection from an invalid IP address")
+			io.WriteString(conn, "ERROR::INVALID_IP_FORMAT\n")
 			return
 		}
-
-		temp := strings.TrimSpace(string(netData))
-		if strings.Split(temp, "::")[0] == "REGISTER_NODE" || strings.Split(temp, "::")[0] == "REGISTER_NODE_PROPAGATE" {
-			var err error
-
-			nodePort := strings.Split(temp, "::")[1]
-			nodePubk := strings.Split(temp, "::")[2]
-			log.Println(strings.Split(temp, "::"))
-			nodeSign, err := hex.DecodeString(strings.ReplaceAll(strings.Split(temp, "::")[3], "NEWLINEBREAK", "\n"))
+		for {
+			netData, err := bufio.NewReader(conn).ReadString('\n')
 			if err != nil {
-				log.Println("could not decode signature: ", err)
-				io.WriteString(conn, "ERROR::SIGNATURE_DECODE_FAILED\n")
-			}
-
-			hasher := sha256.New()
-			hasher.Write([]byte(nodePubk))
-			hashSum := hasher.Sum(nil)
-
-			nodePubKey, err := ParseRsaPublicKeyFromPemStr(nodePubk)
-			if err != nil {
-				log.Println("could not parse public key: ", err)
-				io.WriteString(conn, "ERROR::PUBKEY_PARSE_FAILED\n")
-			}
-
-			err = rsa.VerifyPSS(nodePubKey, crypto.SHA256, hashSum, nodeSign, nil)
-			if err != nil {
-				log.Println("could not verify signature: ", err)
-				io.WriteString(conn, "ERROR::INVALID_SIGNATURE\n")
+				log.Println(err)
 				return
 			}
 
-			log.Println("Registering node on port", nodePort)
-			// TODO: register node and propagate to other nodes
+			temp := strings.TrimSpace(string(netData))
+			log.Println(temp) // TODO: REMOVE IN PROD
+			if strings.Split(temp, "::")[0] == "REGISTER_NODE" || strings.Split(temp, "::")[0] == "REGISTER_NODE_PROPAGATE" {
+				var err error
+
+				nodePort := strings.Split(temp, "::")[1]
+				nodePubk := strings.ReplaceAll(strings.Split(temp, "::")[2], "NEWLINEBREAK", "\n")
+				nodeSign, err := hex.DecodeString(strings.Split(temp, "::")[3])
+				if err != nil {
+					log.Println("could not decode signature: ", err)
+					io.WriteString(conn, "ERROR::SIGNATURE_DECODE_FAILED\n")
+				}
+
+				hasher := sha256.New()
+				hasher.Write([]byte(nodePubk))
+				hashSum := hasher.Sum(nil)
+
+				nodePubKey, err := ParseRsaPublicKeyFromPemStr(nodePubk)
+				if err != nil {
+					log.Println("could not parse public key: ", err)
+					io.WriteString(conn, "ERROR::PUBKEY_PARSE_FAILED\n")
+				}
+
+				err = rsa.VerifyPSS(nodePubKey, crypto.SHA256, hashSum, nodeSign, nil)
+				if err != nil {
+					log.Println("could not verify signature: ", err)
+					io.WriteString(conn, "ERROR::INVALID_SIGNATURE\n")
+					return
+				}
+
+				alreadyExists := false
+				for _, node := range nodesList {
+					if node.(map[string]interface{})["PUBKEY"].(string) == nodePubk {
+						alreadyExists = true
+						break
+					}
+				}
+				mykey, _ := ExportRsaPublicKeyAsPemStr(&privateKey.PublicKey)
+				hasher = sha256.New()
+				hasher.Write([]byte(nodePubk))
+				viewPK := hex.EncodeToString(hasher.Sum(nil))
+				if len(strings.Split(temp, "::")) == 5 {
+					nodeIP = strings.Split(temp, "::")[4]
+				}
+				if !alreadyExists && nodePubk != mykey {
+					log.Println("Registering node from "+nodeIP+" on port", nodePort)
+					nodesList[viewPK] = map[string]interface{}{
+						"IP":     nodeIP,
+						"PORT":   nodePort,
+						"PUBKEY": nodePubk,
+					}
+					go propagateNewNode(temp, nodeIP+":"+nodePort)
+					io.WriteString(conn, "NODE_REGISTERED\n")
+				} else if alreadyExists {
+					log.Println("Node already registered")
+				} else if nodePubk == mykey {
+					log.Println("[WARNING] Node public key matches self")
+				}
+			} else if strings.Split(temp, "::")[0] == "GET_PUBKEY" {
+				log.Println(nodeIP + " requested public key")
+				mykey, _ := ExportRsaPublicKeyAsPemStr(&privateKey.PublicKey)
+				io.WriteString(conn, strings.ReplaceAll(mykey, "\n", "NEWLINEBREAK")+"\n")
+			}
 		}
+	} else {
+		log.Println("Denied connection from an invalid IP address")
+		io.WriteString(conn, "ERROR::INVALID_IP_FORMAT\n")
+		return
 	}
 }
 
@@ -427,6 +504,8 @@ func registerWithPeers() {
 			log.Println("Ignoring error, already running as an origin node")
 		}
 		return
+	} else {
+		log.Println("Origin address specified:", originAddr)
 	}
 
 	c, err := getConn(originAddr)
@@ -434,26 +513,47 @@ func registerWithPeers() {
 	if err != nil && stype != "origin" {
 		log.Println("INITIAL NODE OFFLINE:", err)
 	} else {
-		pubkey := privateKey.PublicKey
-		pubKeyMarshal, _ := ExportRsaPublicKeyAsPemStr(&pubkey)
-		fmt.Fprintf(c, "REGISTER_NODE::"+port+"::"+strings.ReplaceAll(pubKeyMarshal, "\n", "NEWLINEBREAK")+"::"+signMessage(pubKeyMarshal, privateKey)+"\n")
+		if addr, ok := c.RemoteAddr().(*net.TCPAddr); ok {
+			nodeIP := addr.IP.String()
+			if strings.Contains(nodeIP, ":") {
+				c.Close()
+				log.Println("Broke connection with origin node")
+				log.Println("Error registering node: invalid origin node IP address")
+				shutDownTCP()
+				killServer = true
+				return
+			}
+			log.Println("Connected to origin node at " + nodeIP)
+			pubkey := privateKey.PublicKey
+			pubKeyMarshal, _ := ExportRsaPublicKeyAsPemStr(&pubkey)
+			fmt.Fprintf(c, "REGISTER_NODE::"+port+"::"+strings.ReplaceAll(pubKeyMarshal, "\n", "NEWLINEBREAK")+"::"+signMessage(pubKeyMarshal, privateKey)+"\n")
 
-		raw, _ := bufio.NewReader(c).ReadString('\n')
-		message := strings.Split(raw, "\n")[0]
-		if message == "NODE_REGISTERED" {
-			fmt.Fprintf(c, "GET_PUBKEY\n")
 			raw, _ := bufio.NewReader(c).ReadString('\n')
 			message := strings.Split(raw, "\n")[0]
-			nodesList[message] = map[string]interface{}{
-				"IP":     strings.Split(originAddr, ":")[0],
-				"PORT":   strings.Split(originAddr, ":")[1],
-				"PUBKEY": message,
+			if message == "NODE_REGISTERED" {
+				fmt.Fprintf(c, "GET_PUBKEY\n")
+				raw, _ := bufio.NewReader(c).ReadString('\n')
+				message := strings.Split(raw, "\n")[0]
+				nodesList[message] = map[string]interface{}{
+					"IP":     strings.Split(originAddr, ":")[0],
+					"PORT":   strings.Split(originAddr, ":")[1],
+					"PUBKEY": message,
+				}
+				log.Println("Node registered with initial node")
+				log.Println("Network propagation is in progress this may take up to an hour")
+			} else {
+				if stype != "origin" {
+					log.Println("Error registering node")
+					shutDownTCP()
+					killServer = true
+					return
+				} else {
+					log.Println("Error registering node ignored: this is an origin node")
+				}
 			}
-			log.Println("Node registered with initial node")
-			log.Println("Network propagation is in progress this may take up to an hour")
 		} else {
 			if stype != "origin" {
-				log.Println("Error registering node")
+				log.Println("Error registering node: invalid origin node IP address")
 				shutDownTCP()
 				killServer = true
 				return
