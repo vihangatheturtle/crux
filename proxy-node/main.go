@@ -308,7 +308,7 @@ func main() {
 	time.Sleep(time.Second)
 	go startTCPServer()
 	go registerWithPeers()
-	proxySrv = &http.Server{Addr: ":" + port, Handler: proxy}
+	proxySrv = &http.Server{Addr: "0.0.0.0:" + port, Handler: proxy}
 	proxySrv.ListenAndServe()
 }
 
@@ -341,7 +341,7 @@ func startTCPServer() {
 	p2pPort, _ := strconv.Atoi(port)
 	p2pPort += 1
 	p2pPortStr := strconv.Itoa(p2pPort)
-	tcpSrv, err := net.Listen("tcp", ":"+p2pPortStr)
+	tcpSrv, err := net.Listen("tcp", "0.0.0.0:"+p2pPortStr)
 	if err != nil {
 		log.Fatal(err)
 	}
