@@ -101,6 +101,15 @@ func getPublicAddressFromPrivate(privateKey *rsa.PrivateKey) string {
 	return hex.EncodeToString(hasher.Sum(nil))
 }
 
+func EncryptWithPublicKey(msg []byte, pub *rsa.PublicKey) []byte {
+	hash := sha512.New()
+	ciphertext, err := rsa.EncryptOAEP(hash, rand.Reader, pub, msg, nil)
+	if err != nil {
+		log.Println(err)
+	}
+	return ciphertext
+}
+
 func DecryptWithPrivateKey(ciphertext []byte, priv *rsa.PrivateKey) []byte {
 	hash := sha512.New()
 	plaintext, err := rsa.DecryptOAEP(hash, rand.Reader, priv, ciphertext, nil)
@@ -212,6 +221,10 @@ func main() {
 	}
 	publicKey = getPublicAddressFromPrivate(privateKey)
 
+	export, _ := ExportRsaPublicKeyAsPemStr(&privateKey.PublicKey)
+	pb, _ := ParseRsaPublicKeyFromPemStr(export)
+	log.Println(b64.StdEncoding.EncodeToString(EncryptWithPublicKey([]byte("test||next server public view key"), pb)))
+
 	requestHandleFunc := func(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
 		if req.Method == "POST" {
 			bs, _ := ioutil.ReadAll(req.Body)
@@ -225,6 +238,7 @@ func main() {
 						d := strings.Split(string(DecryptWithPrivateKey(ciphertext, privateKey)), "||")
 						log.Println("DECRYPT DATA", d[0])
 						log.Println("DECRYPT META", d[1])
+						log.Println(nodesList)
 					}
 				} else {
 					responseObj := map[string]interface{}{
@@ -311,7 +325,6 @@ func main() {
 	})()
 	time.Sleep(time.Second)
 	go startTCPServer()
-	go registerWithPeers()
 	proxySrv = &http.Server{Addr: "0.0.0.0:" + port, Handler: proxy}
 	proxySrv.ListenAndServe()
 }
@@ -448,6 +461,22 @@ func handleConn(conn net.Conn) {
 					}
 					go propagateNewNode(temp, nodeIP+":"+nodePort)
 					io.WriteString(conn, "NODE_REGISTERED\n")
+					time.Sleep(time.Second * 2)
+					if strings.Split(temp, "::")[0] == "REGISTER_NODE_PROPAGATE" {
+						log.Println("Registering with new node")
+						newNode, err := net.Dial("tcp", nodeIP+":"+nodePort)
+						if err != nil {
+							log.Fatal("Couldnt respond to propagated node: "+viewPK+",", err)
+						} else {
+							pubkey := privateKey.PublicKey
+							pubKeyMarshal, _ := ExportRsaPublicKeyAsPemStr(&pubkey)
+							p2pPort, _ := strconv.Atoi(port)
+							p2pPort += 1
+							p2pPortStr := strconv.Itoa(p2pPort)
+							fmt.Fprintf(newNode, "REGISTER_NODE::"+p2pPortStr+"::"+strings.ReplaceAll(pubKeyMarshal, "\n", "NEWLINEBREAK")+"::"+signMessage(pubKeyMarshal, privateKey)+"\n")
+							log.Println("Registered with new node at " + nodeIP + ":" + nodePort)
+						}
+					}
 				} else if alreadyExists {
 					log.Println("Node already registered")
 				} else if nodePubk == mykey {
@@ -476,6 +505,8 @@ func startTCPServer() {
 		log.Fatal(err)
 	}
 	log.Println("TCP Server Listening on port", p2pPortStr)
+	time.Sleep(time.Second)
+	go registerWithPeers()
 	defer (func() {
 		shutDownTCP()
 	})()
@@ -526,7 +557,10 @@ func registerWithPeers() {
 			log.Println("Connected to origin node at " + nodeIP)
 			pubkey := privateKey.PublicKey
 			pubKeyMarshal, _ := ExportRsaPublicKeyAsPemStr(&pubkey)
-			fmt.Fprintf(c, "REGISTER_NODE::"+port+"::"+strings.ReplaceAll(pubKeyMarshal, "\n", "NEWLINEBREAK")+"::"+signMessage(pubKeyMarshal, privateKey)+"\n")
+			p2pPort, _ := strconv.Atoi(port)
+			p2pPort += 1
+			p2pPortStr := strconv.Itoa(p2pPort)
+			fmt.Fprintf(c, "REGISTER_NODE::"+p2pPortStr+"::"+strings.ReplaceAll(pubKeyMarshal, "\n", "NEWLINEBREAK")+"::"+signMessage(pubKeyMarshal, privateKey)+"\n")
 
 			raw, _ := bufio.NewReader(c).ReadString('\n')
 			message := strings.Split(raw, "\n")[0]
