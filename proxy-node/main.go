@@ -226,59 +226,91 @@ func main() {
 	log.Println(b64.StdEncoding.EncodeToString(EncryptWithPublicKey([]byte("test||next server public view key"), pb)))
 
 	requestHandleFunc := func(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
-		if req.Method == "POST" {
-			bs, _ := ioutil.ReadAll(req.Body)
-			req.Body.Close()
-			if req.Host == "cruxnet.main.pnet.tunnel" {
-				if json.Valid(bs) {
-					var oldBodyData map[string]interface{}
-					json.Unmarshal(bs, &oldBodyData)
-					if isRequestBodyCruxNetForwardRequest(oldBodyData) {
-						ciphertext, _ := b64.StdEncoding.DecodeString(oldBodyData["_crux_request_encrypted"].(string))
-						d := strings.Split(string(DecryptWithPrivateKey(ciphertext, privateKey)), "||")
-						log.Println("DECRYPT DATA", d[0])
-						log.Println("DECRYPT META", d[1])
-						log.Println(nodesList)
+		if stype != "browser" {
+			if req.Method == "POST" {
+				bs, _ := ioutil.ReadAll(req.Body)
+				req.Body.Close()
+				if req.Host == "cruxnet.main.pnet.tunnel" {
+					if json.Valid(bs) {
+						var oldBodyData map[string]interface{}
+						json.Unmarshal(bs, &oldBodyData)
+						if isRequestBodyCruxNetForwardRequest(oldBodyData) {
+							ciphertext, _ := b64.StdEncoding.DecodeString(oldBodyData["_crux_request_encrypted"].(string))
+							d := strings.Split(string(DecryptWithPrivateKey(ciphertext, privateKey)), "||")
+							log.Println("DECRYPT DATA", d[0])
+							log.Println("DECRYPT META", d[1])
+							log.Println(nodesList)
+						}
+					} else {
+						responseObj := map[string]interface{}{
+							"error":   true,
+							"message": "Invalid request body",
+						}
+						json, _ := json.Marshal(responseObj)
+						newReq := goproxy.NewResponse(req,
+							goproxy.ContentTypeText,
+							400,
+							string(json),
+						)
+						newReq.Header.Set("Content-Type", "application/json")
+						newReq.Header.Set("Access-Control-Allow-Origin", "*")
+						return req, newReq
 					}
-				} else {
+				}
+			} else if req.Method == "GET" {
+				pubkey := privateKey.PublicKey
+				pubKeyMarshal, _ := ExportRsaPublicKeyAsPemStr(&pubkey)
+				//pubKeyMarshal := x509.MarshalPKCS1PublicKey(&pubkey)
+				hasher := sha256.New()
+				hasher.Write([]byte(pubKeyMarshal))
+				pubKeyHash := hasher.Sum(nil)
+				PKMarshalSignature, _ := rsa.SignPSS(rand.Reader, privateKey, crypto.SHA256, pubKeyHash, nil)
+				responseObj := map[string]interface{}{
+					"publicKey":          pubKeyMarshal,
+					"publicKeySignature": PKMarshalSignature,
+					"publicViewKey":      publicKey,
+				}
+				json, _ := json.Marshal(responseObj)
+				newReq := goproxy.NewResponse(req,
+					goproxy.ContentTypeText,
+					200,
+					string(json),
+				)
+				newReq.Header.Set("Content-Type", "application/json")
+				newReq.Header.Set("Access-Control-Allow-Origin", "*")
+				if req.Host == "cruxnet.main.pnet.node-data" {
+					return req, newReq
+				}
+			}
+		} else {
+			// If we are running on a browser client, create needed request first
+			if strings.Split(req.Host, ".")[1] == "node" {
+				log.Println("Generating request for server", strings.Split(req.Host, ".")[0])
+				request := map[string]interface{}{
+					"publicViewKey": strings.Split(req.Host, ".")[0],
+					"path":          req.URL.Path,
+					"method":        req.Method,
+				}
+				log.Println("REQUEST", request)
+				log.Println("Picking random tunnel nodes")
+				log.Println(len(nodesList), "available nodes")
+				if len(nodesList) == 0 {
+					log.Println("No nodes available, dropping request")
 					responseObj := map[string]interface{}{
 						"error":   true,
-						"message": "Invalid request body",
+						"message": "No nodes available",
 					}
 					json, _ := json.Marshal(responseObj)
 					newReq := goproxy.NewResponse(req,
 						goproxy.ContentTypeText,
-						400,
+						500,
 						string(json),
 					)
 					newReq.Header.Set("Content-Type", "application/json")
 					newReq.Header.Set("Access-Control-Allow-Origin", "*")
 					return req, newReq
 				}
-			}
-		} else if req.Method == "GET" {
-			pubkey := privateKey.PublicKey
-			pubKeyMarshal, _ := ExportRsaPublicKeyAsPemStr(&pubkey)
-			//pubKeyMarshal := x509.MarshalPKCS1PublicKey(&pubkey)
-			hasher := sha256.New()
-			hasher.Write([]byte(pubKeyMarshal))
-			pubKeyHash := hasher.Sum(nil)
-			PKMarshalSignature, _ := rsa.SignPSS(rand.Reader, privateKey, crypto.SHA256, pubKeyHash, nil)
-			responseObj := map[string]interface{}{
-				"publicKey":          pubKeyMarshal,
-				"publicKeySignature": PKMarshalSignature,
-				"publicViewKey":      publicKey,
-			}
-			json, _ := json.Marshal(responseObj)
-			newReq := goproxy.NewResponse(req,
-				goproxy.ContentTypeText,
-				200,
-				string(json),
-			)
-			newReq.Header.Set("Content-Type", "application/json")
-			newReq.Header.Set("Access-Control-Allow-Origin", "*")
-			if req.Host == "cruxnet.main.pnet.node-data" {
-				return req, newReq
+				return req, nil
 			}
 		}
 		//bs, _ := ioutil.ReadAll(req.Body)
@@ -324,7 +356,20 @@ func main() {
 		}
 	})()
 	time.Sleep(time.Second)
-	go startTCPServer()
+	if stype != "browser" {
+		go startTCPServer()
+	} else {
+		if originAddr != "" {
+			fetchAllPeers(originAddr)
+			log.Println(nodesList)
+		} else {
+			log.Println("No origin address specified, not fetching peers")
+			shutDownProxy()
+			shutDownTCP()
+			killServer = true
+			return
+		}
+	}
 	proxySrv = &http.Server{Addr: "0.0.0.0:" + port, Handler: proxy}
 	proxySrv.ListenAndServe()
 }
@@ -486,6 +531,10 @@ func handleConn(conn net.Conn) {
 				log.Println(nodeIP + " requested public key")
 				mykey, _ := ExportRsaPublicKeyAsPemStr(&privateKey.PublicKey)
 				io.WriteString(conn, strings.ReplaceAll(mykey, "\n", "NEWLINEBREAK")+"\n")
+			} else if strings.Split(temp, "::")[0] == "GET_NODES" {
+				log.Println(nodeIP + " requested nodes")
+				nodes, _ := json.Marshal(nodesList)
+				io.WriteString(conn, string(nodes)+"\n")
 			}
 		}
 	} else {
@@ -495,8 +544,61 @@ func handleConn(conn net.Conn) {
 	}
 }
 
-func fetchAllPeers() {
+func fetchAllPeers(addr string) {
+	c, err := getConn(addr)
 
+	if err != nil && stype != "origin" {
+		log.Println("INITIAL NODE OFFLINE:", err)
+	} else {
+		if addr, ok := c.RemoteAddr().(*net.TCPAddr); ok {
+			nodeIP := addr.IP.String()
+			if strings.Contains(nodeIP, ":") {
+				c.Close()
+				log.Println("Broke connection with origin node")
+				log.Println("Error registering node: invalid origin node IP address")
+				shutDownTCP()
+				killServer = true
+				return
+			}
+			log.Println("Connected to node at " + nodeIP)
+			fmt.Fprintf(c, "GET_NODES\n")
+			raw, _ := bufio.NewReader(c).ReadString('\n')
+			message := strings.Split(raw, "\n")[0]
+			var jsonObj map[string]interface{}
+			json.Unmarshal([]byte(message), &jsonObj)
+
+			l := make([]string, len(nodesList))
+			j := 0
+			for t := range nodesList {
+				l[j] = t
+				j++
+			}
+
+			k := make([]string, len(jsonObj))
+			i := 0
+			for s := range jsonObj {
+				k[i] = s
+				i++
+			}
+
+			for _, v := range k {
+				if !contains(l, v) {
+					nodesList[v] = jsonObj[v]
+					log.Println("Fetching nodes from " + jsonObj[v].(map[string]interface{})["IP"].(string) + ":" + jsonObj[v].(map[string]interface{})["PORT"].(string))
+					fetchAllPeers(jsonObj[v].(map[string]interface{})["IP"].(string) + ":" + jsonObj[v].(map[string]interface{})["PORT"].(string))
+				}
+			}
+		} else {
+			if stype != "origin" {
+				log.Println("Error registering node: invalid origin node IP address")
+				shutDownTCP()
+				killServer = true
+				return
+			} else {
+				log.Println("Error registering node ignored: this is an origin node")
+			}
+		}
+	}
 }
 
 func startTCPServer() {
@@ -510,11 +612,7 @@ func startTCPServer() {
 	}
 	log.Println("TCP Server Listening on port", p2pPortStr)
 	time.Sleep(time.Second)
-	if stype != "browser" {
-		go registerWithPeers()
-	} else {
-		go fetchAllPeers()
-	}
+	go registerWithPeers()
 	defer (func() {
 		shutDownTCP()
 	})()
@@ -576,10 +674,13 @@ func registerWithPeers() {
 				fmt.Fprintf(c, "GET_PUBKEY\n")
 				raw, _ := bufio.NewReader(c).ReadString('\n')
 				message := strings.Split(raw, "\n")[0]
-				nodesList[message] = map[string]interface{}{
+				hasher := sha256.New()
+				hasher.Write([]byte(strings.ReplaceAll(message, "NEWLINEBREAK", "\n")))
+				viewPK := hex.EncodeToString(hasher.Sum(nil))
+				nodesList[viewPK] = map[string]interface{}{
 					"IP":     strings.Split(originAddr, ":")[0],
 					"PORT":   strings.Split(originAddr, ":")[1],
-					"PUBKEY": message,
+					"PUBKEY": strings.ReplaceAll(message, "NEWLINEBREAK", "\n"),
 				}
 				log.Println("Node registered with initial node")
 				log.Println("Network propagation is in progress this may take up to an hour")
