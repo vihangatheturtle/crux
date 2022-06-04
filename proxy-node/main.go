@@ -495,6 +495,10 @@ func handleConn(conn net.Conn) {
 	}
 }
 
+func fetchAllPeers() {
+
+}
+
 func startTCPServer() {
 	// start TCP and serve TCP server
 	p2pPort, _ := strconv.Atoi(port)
@@ -506,7 +510,11 @@ func startTCPServer() {
 	}
 	log.Println("TCP Server Listening on port", p2pPortStr)
 	time.Sleep(time.Second)
-	go registerWithPeers()
+	if stype != "browser" {
+		go registerWithPeers()
+	} else {
+		go fetchAllPeers()
+	}
 	defer (func() {
 		shutDownTCP()
 	})()
