@@ -18,6 +18,7 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
+	mrand "math/rand"
 	"net"
 	"net/http"
 	"os"
@@ -206,6 +207,19 @@ func shutDownProxy() {
 	proxySrv.Shutdown(context.Background())
 }
 
+func chunkBytes(buf []byte, lim int) [][]byte {
+	var chunk []byte
+	chunks := make([][]byte, 0, len(buf)/lim+1)
+	for len(buf) >= lim {
+		chunk, buf = buf[:lim], buf[lim:]
+		chunks = append(chunks, chunk)
+	}
+	if len(buf) > 0 {
+		chunks = append(chunks, buf[:len(buf)])
+	}
+	return chunks
+}
+
 func main() {
 	log.Println("Loading environment variables")
 	killServer = false
@@ -218,7 +232,7 @@ func main() {
 	pkFromFile, err := ioutil.ReadFile("private.pem")
 	if err != nil {
 		log.Println("No existing private key found, creating a new one")
-		pk, err := rsa.GenerateKey(rand.Reader, 2048)
+		pk, err := rsa.GenerateKey(rand.Reader, 8192)
 		if err != nil {
 			panic(err)
 		}
@@ -239,7 +253,7 @@ func main() {
 		}
 	}
 	publicKey = getPublicAddressFromPrivate(privateKey)
-	go shutdownAllNodes()
+	//go shutdownAllNodes()
 
 	export, _ := ExportRsaPublicKeyAsPemStr(&privateKey.PublicKey)
 	pb, _ := ParseRsaPublicKeyFromPemStr(export)
@@ -307,10 +321,10 @@ func main() {
 			if strings.Split(req.Host, ".")[1] == "node" {
 				log.Println("Generating request for server", strings.Split(req.Host, ".")[0])
 				request := map[string]interface{}{
-					"publicViewKey": strings.Split(req.Host, ".")[0],
-					"path":          req.URL.Path,
-					"method":        req.Method,
+					"path":   req.URL.Path,
+					"method": req.Method,
 				}
+				reqMarshal, _ := json.Marshal(request)
 				log.Println("REQUEST", request)
 				log.Println("Picking random tunnel nodes")
 				log.Println(len(nodesList), "available nodes")
@@ -345,7 +359,73 @@ func main() {
 					newReq.Header.Set("Access-Control-Allow-Origin", "*")
 					return req, newReq
 				} else {
-					// Enough nodes available, pick 7 random nodes
+					// Enough nodes available, pick 4 random nodes
+					var nodeIndexes []int
+					for {
+						if len(nodeIndexes) < 4 {
+							index := mrand.Intn(len(nodesList))
+							add := true
+							for i := 0; i < len(nodeIndexes); i++ {
+								if nodeIndexes[i] == index {
+									add = false
+								}
+							}
+							if add {
+								nodeIndexes = append(nodeIndexes, index)
+							}
+						} else {
+							break
+						}
+					}
+					k := make([]string, len(nodesList))
+					i := 0
+					for s := range nodesList {
+						k[i] = s
+						i++
+					}
+					var data []byte
+					validDomain := false
+					for i := 0; i < len(k); i++ {
+						if k[i] == strings.Split(req.Host, ".")[0] {
+							validDomain = true
+							break
+						}
+						log.Println(k[i]) // TODO: REMOVE IN PROD
+					}
+					if validDomain {
+						ndata, _ := nodesList[strings.Split(req.Host, ".")[0]].(map[string]interface{})
+						pk, _ := ParseRsaPublicKeyFromPemStr(ndata["PUBKEY"].(string))
+						data = EncryptWithPublicKey(reqMarshal, pk)
+						byteChunks := chunkBytes(data, 80)
+						var tempData [][]byte
+						for i := 0; i < len(byteChunks); i++ {
+							tdata := byteChunks[i]
+							for i := 0; i < len(nodeIndexes); i++ {
+								ndata, _ := nodesList[k[i]].(map[string]interface{})
+								pk, _ := ParseRsaPublicKeyFromPemStr(ndata["PUBKEY"].(string))
+								log.Println(tdata)
+								tdata = EncryptWithPublicKey(tdata, pk)
+							}
+							tempData = append(tempData, tdata)
+						}
+						jd, _ := json.Marshal(tempData)
+						log.Println(jd)
+					} else {
+						log.Println("Invalid domain, dropping request")
+						responseObj := map[string]interface{}{
+							"error":   true,
+							"message": "Invalid domain",
+						}
+						json, _ := json.Marshal(responseObj)
+						newReq := goproxy.NewResponse(req,
+							goproxy.ContentTypeText,
+							400,
+							string(json),
+						)
+						newReq.Header.Set("Content-Type", "application/json")
+						newReq.Header.Set("Access-Control-Allow-Origin", "*")
+						return req, newReq
+					}
 				}
 				return req, nil
 			}
@@ -397,8 +477,13 @@ func main() {
 		go startTCPServer()
 	} else {
 		if originAddr != "" {
-			fetchAllPeers(originAddr)
-			log.Println(nodesList)
+			go (func() {
+				for {
+					fetchAllPeers(originAddr)
+					log.Println("Updated nodes list")
+					time.Sleep(time.Second * 5)
+				}
+			})()
 		} else {
 			log.Println("No origin address specified, not fetching peers")
 			shutDownProxy()
