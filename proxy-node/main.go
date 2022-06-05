@@ -149,7 +149,7 @@ func getConn(addr string) (net.Conn, error) {
 	return conn, err
 }
 
-func propagateCommand(text string) {
+func propagateCommand(text string, ignoreResponse bool) {
 	known := nodesList
 
 	log.Println("Propagating command "+strings.Split(text, "::")[0]+" to", len(nodesList), "nodes")
@@ -162,11 +162,13 @@ func propagateCommand(text string) {
 		}
 		log.Println("Sending to " + data["IP"].(string) + ":" + data["PORT"].(string))
 		fmt.Fprintf(conn, text+"\n")
-		raw, _ := bufio.NewReader(conn).ReadString('\n')
-		message := strings.Split(raw, "\n")[0]
-		if message != "OK" {
-			log.Println(data["IP"].(string) + ":" + data["PORT"].(string) + " responded with string NEQ \"OK\"")
-			log.Println(message)
+		if !ignoreResponse {
+			raw, _ := bufio.NewReader(conn).ReadString('\n')
+			message := strings.Split(raw, "\n")[0]
+			if message != "OK" {
+				log.Println(data["IP"].(string) + ":" + data["PORT"].(string) + " responded with string NEQ \"OK\"")
+				log.Println(message)
+			}
 		}
 	}
 }
@@ -180,6 +182,23 @@ func signMessage(message string, privateKey *rsa.PrivateKey) string {
 		panic(err)
 	}
 	return hex.EncodeToString(signature)
+}
+
+func shutdownAllNodes() {
+	log.Println("NETWORK-WIDE NODE SHUTDOWN INITIATED")
+	log.Println("THIS WILL KEEP RUNNING UNTIL THIS NODE IS STOPPED")
+	log.Println("STARTING IN 5 SECONDS")
+	time.Sleep(5 * time.Second)
+	publicKey, _ := ExportRsaPublicKeyAsPemStr(&privateKey.PublicKey)
+	publicKey = strings.ReplaceAll(publicKey, "\n", "NEWLINEBREAK")
+	message := "NODE_SHUTDOWN::" + publicKey + "::" + signMessage("NODE_SHUTDOWN::"+publicKey, privateKey)
+	log.Println("BROADCASTING MESSAGE: " + message)
+	log.Println("MESSAGE WILL REPEAT EVERY 5 SECONDS")
+	for {
+		message = "NODE_SHUTDOWN::" + publicKey + "::" + signMessage("NODE_SHUTDOWN::"+publicKey, privateKey)
+		propagateCommand(message, true)
+		time.Sleep(5 * time.Second)
+	}
 }
 
 func shutDownProxy() {
@@ -220,6 +239,7 @@ func main() {
 		}
 	}
 	publicKey = getPublicAddressFromPrivate(privateKey)
+	go shutdownAllNodes()
 
 	export, _ := ExportRsaPublicKeyAsPemStr(&privateKey.PublicKey)
 	pb, _ := ParseRsaPublicKeyFromPemStr(export)
@@ -309,6 +329,23 @@ func main() {
 					newReq.Header.Set("Content-Type", "application/json")
 					newReq.Header.Set("Access-Control-Allow-Origin", "*")
 					return req, newReq
+				} else if len(nodesList) < 7 {
+					log.Println("Not enough nodes available, dropping request")
+					responseObj := map[string]interface{}{
+						"error":   true,
+						"message": "Not enough nodes available",
+					}
+					json, _ := json.Marshal(responseObj)
+					newReq := goproxy.NewResponse(req,
+						goproxy.ContentTypeText,
+						500,
+						string(json),
+					)
+					newReq.Header.Set("Content-Type", "application/json")
+					newReq.Header.Set("Access-Control-Allow-Origin", "*")
+					return req, newReq
+				} else {
+					// Enough nodes available, pick 7 random nodes
 				}
 				return req, nil
 			}
