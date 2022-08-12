@@ -207,6 +207,19 @@ func shutDownProxy() {
 	proxySrv.Shutdown(context.Background())
 }
 
+func chunkBytes(buf []byte, lim int) [][]byte {
+	var chunk []byte
+	chunks := make([][]byte, 0, len(buf)/lim+1)
+	for len(buf) >= lim {
+		chunk, buf = buf[:lim], buf[lim:]
+		chunks = append(chunks, chunk)
+	}
+	if len(buf) > 0 {
+		chunks = append(chunks, buf[:len(buf)])
+	}
+	return chunks
+}
+
 func main() {
 	log.Println("Loading environment variables")
 	killServer = false
@@ -240,6 +253,7 @@ func main() {
 		}
 	}
 	publicKey = getPublicAddressFromPrivate(privateKey)
+	// CreateCruxNetworkPacket(privateKey, []byte("testing hehehe"), "GET")
 	//go shutdownAllNodes()
 
 	export, _ := ExportRsaPublicKeyAsPemStr(&privateKey.PublicKey)
@@ -330,7 +344,7 @@ func main() {
 					newReq.Header.Set("Content-Type", "application/json")
 					newReq.Header.Set("Access-Control-Allow-Origin", "*")
 					return req, newReq
-				} else if len(nodesList) < 7 {
+				} else if len(nodesList) < 1 { // CHANGE IN PROD TO "< 7"
 					log.Println("Not enough nodes available, dropping request")
 					responseObj := map[string]interface{}{
 						"error":   true,
@@ -349,7 +363,7 @@ func main() {
 					// Enough nodes available, pick 4 random nodes
 					var nodeIndexes []int
 					for {
-						if len(nodeIndexes) < 4 {
+						if len(nodeIndexes) < 1 { // CHANGE IN PROD TO "< 4"
 							index := mrand.Intn(len(nodesList))
 							add := true
 							for i := 0; i < len(nodeIndexes); i++ {
@@ -380,15 +394,36 @@ func main() {
 						log.Println(k[i]) // TODO: REMOVE IN PROD
 					}
 					if validDomain {
-						ndata, _ := nodesList[strings.Split(req.Host, ".")[0]].(map[string]interface{})
-						pk, _ := ParseRsaPublicKeyFromPemStr(ndata["PUBKEY"].(string))
-						data = EncryptWithPublicKey(reqMarshal, pk)
-						for i := 0; i < len(nodeIndexes); i++ {
-							ndata, _ := nodesList[k[i]].(map[string]interface{})
-							pk, _ := ParseRsaPublicKeyFromPemStr(ndata["PUBKEY"].(string))
-							data = EncryptWithPublicKey([]byte(data), pk)
+						// ndata, _ := nodesList[strings.Split(req.Host, ".")[0]].(map[string]interface{})
+						// pk, _ := ParseRsaPublicKeyFromPemStr(ndata["PUBKEY"].(string))
+						// Add a layer of encryption for each node
+						var chunk CruxNetworkPacket = CruxNetworkPacket{
+							Version: 0,
 						}
-						log.Println(data)
+						for i := 0; i < len(nodeIndexes); i++ {
+							// Get list of keys in nodesList
+							var k []string
+							for s := range nodesList {
+								k = append(k, s)
+							}
+							nodePk, _ := ParseRsaPublicKeyFromPemStr(nodesList[k[nodeIndexes[i]]].(map[string]interface{})["PUBKEY"].(string))
+							eData := reqMarshal
+							if chunk.Version != 0 {
+								mchunk, _ := json.Marshal(chunk)
+								eData = mchunk
+							}
+							packet := CreateCruxNetworkPacket(nodePk, privateKey, eData, "GET")
+							chunk = packet
+						}
+						data, _ = json.Marshal(chunk)
+						log.Println("PACKET", string(data))
+						// Temporary so i can see response
+						newReq := goproxy.NewResponse(req,
+							goproxy.ContentTypeText,
+							400,
+							string(data),
+						)
+						return req, newReq
 					} else {
 						log.Println("Invalid domain, dropping request")
 						responseObj := map[string]interface{}{
@@ -452,6 +487,7 @@ func main() {
 		}
 	})()
 	time.Sleep(time.Second)
+	log.Println("Crux server is running as", stype)
 	if stype != "browser" {
 		go startTCPServer()
 	} else {
@@ -645,6 +681,8 @@ func handleConn(conn net.Conn) {
 	}
 }
 
+var initialNodeRegistrationBrowserMode bool = true
+
 func fetchAllPeers(addr string) {
 	c, err := getConn(addr)
 
@@ -662,6 +700,22 @@ func fetchAllPeers(addr string) {
 				return
 			}
 			log.Println("Connected to node at " + nodeIP)
+			if initialNodeRegistrationBrowserMode {
+				log.Println("Registering initial node")
+				fmt.Fprintf(c, "GET_PUBKEY\n")
+				raw, _ := bufio.NewReader(c).ReadString('\n')
+				message := strings.Split(raw, "\n")[0]
+				hasher := sha256.New()
+				hasher.Write([]byte(strings.ReplaceAll(message, "NEWLINEBREAK", "\n")))
+				viewPK := hex.EncodeToString(hasher.Sum(nil))
+				nodesList[viewPK] = map[string]interface{}{
+					"IP":     strings.Split(originAddr, ":")[0],
+					"PORT":   strings.Split(originAddr, ":")[1],
+					"PUBKEY": strings.ReplaceAll(message, "NEWLINEBREAK", "\n"),
+				}
+				log.Println("Registered initial node")
+				initialNodeRegistrationBrowserMode = false
+			}
 			fmt.Fprintf(c, "GET_NODES\n")
 			raw, _ := bufio.NewReader(c).ReadString('\n')
 			message := strings.Split(raw, "\n")[0]

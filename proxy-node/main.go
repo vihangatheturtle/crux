@@ -253,6 +253,7 @@ func main() {
 		}
 	}
 	publicKey = getPublicAddressFromPrivate(privateKey)
+	// CreateCruxNetworkPacket(privateKey, []byte("testing hehehe"), "GET")
 	//go shutdownAllNodes()
 
 	export, _ := ExportRsaPublicKeyAsPemStr(&privateKey.PublicKey)
@@ -343,7 +344,7 @@ func main() {
 					newReq.Header.Set("Content-Type", "application/json")
 					newReq.Header.Set("Access-Control-Allow-Origin", "*")
 					return req, newReq
-				} else if len(nodesList) < 7 {
+				} else if len(nodesList) < 1 { // CHANGE IN PROD
 					log.Println("Not enough nodes available, dropping request")
 					responseObj := map[string]interface{}{
 						"error":   true,
@@ -393,23 +394,29 @@ func main() {
 						log.Println(k[i]) // TODO: REMOVE IN PROD
 					}
 					if validDomain {
-						ndata, _ := nodesList[strings.Split(req.Host, ".")[0]].(map[string]interface{})
-						pk, _ := ParseRsaPublicKeyFromPemStr(ndata["PUBKEY"].(string))
-						data = EncryptWithPublicKey(reqMarshal, pk)
-						byteChunks := chunkBytes(data, 80)
-						var tempData [][]byte
-						for i := 0; i < len(byteChunks); i++ {
-							tdata := byteChunks[i]
-							for i := 0; i < len(nodeIndexes); i++ {
-								ndata, _ := nodesList[k[i]].(map[string]interface{})
-								pk, _ := ParseRsaPublicKeyFromPemStr(ndata["PUBKEY"].(string))
-								log.Println(tdata)
-								tdata = EncryptWithPublicKey(tdata, pk)
-							}
-							tempData = append(tempData, tdata)
+						// ndata, _ := nodesList[strings.Split(req.Host, ".")[0]].(map[string]interface{})
+						// pk, _ := ParseRsaPublicKeyFromPemStr(ndata["PUBKEY"].(string))
+						// Add a layer of encryption for each node
+						var chunk CruxNetworkPacket = CruxNetworkPacket{
+							Version: 0,
 						}
-						jd, _ := json.Marshal(tempData)
-						log.Println(jd)
+						for i := 0; i < len(nodeIndexes); i++ {
+							// Get list of keys in nodesList
+							var k []string
+							for s := range nodesList {
+								k = append(k, s)
+							}
+							nodePk, _ := ParseRsaPublicKeyFromPemStr(nodesList[k[nodeIndexes[i]]].(map[string]interface{})["PUBKEY"].(string))
+							eData := reqMarshal
+							if chunk.Version != 0 {
+								mchunk, _ := json.Marshal(chunk)
+								eData = mchunk
+							}
+							packet := CreateCruxNetworkPacket(nodePk, privateKey, eData, "GET")
+							chunk = packet
+						}
+						data, _ = json.Marshal(chunk)
+						log.Println(data)
 					} else {
 						log.Println("Invalid domain, dropping request")
 						responseObj := map[string]interface{}{
@@ -473,6 +480,7 @@ func main() {
 		}
 	})()
 	time.Sleep(time.Second)
+	log.Println("Crux server is running as", stype)
 	if stype != "browser" {
 		go startTCPServer()
 	} else {
