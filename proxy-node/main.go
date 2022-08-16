@@ -220,6 +220,8 @@ func chunkBytes(buf []byte, lim int) [][]byte {
 	return chunks
 }
 
+var minimumNodeCount = 1 // CHANGE TO 4
+
 func main() {
 	log.Println("Loading environment variables")
 	killServer = false
@@ -344,7 +346,7 @@ func main() {
 					newReq.Header.Set("Content-Type", "application/json")
 					newReq.Header.Set("Access-Control-Allow-Origin", "*")
 					return req, newReq
-				} else if len(nodesList) < 1 { // CHANGE IN PROD
+				} else if len(nodesList) < minimumNodeCount {
 					log.Println("Not enough nodes available, dropping request")
 					responseObj := map[string]interface{}{
 						"error":   true,
@@ -363,7 +365,7 @@ func main() {
 					// Enough nodes available, pick 4 random nodes
 					var nodeIndexes []int
 					for {
-						if len(nodeIndexes) < 4 {
+						if len(nodeIndexes) < minimumNodeCount {
 							index := mrand.Intn(len(nodesList))
 							add := true
 							for i := 0; i < len(nodeIndexes); i++ {
@@ -417,6 +419,48 @@ func main() {
 						}
 						data, _ = json.Marshal(chunk)
 						log.Println(data)
+						reversedIndexes := ReverseIntSlice(nodeIndexes)
+						log.Println(reversedIndexes)
+						var hasErrorOccurred bool = false
+						for i := 0; i < len(reversedIndexes); i++ {
+							node := nodesList[k[nodeIndexes[i]]].(map[string]interface{})
+							ip := node["IP"].(string)
+							port := node["PORT"].(string)
+							log.Println("Establishing connection to", ip+":"+port)
+							conn, err := net.Dial("tcp", ip+":"+port)
+							if err != nil {
+								log.Println("Error connecting to", ip+":"+port)
+								hasErrorOccurred = true
+								break
+							}
+							log.Println("Sending data to", ip+":"+port)
+							fmt.Fprintf(conn, "PEER_FORWARD_REQUEST::"+string(data)+"\n")
+							_, err = conn.Write([]byte("PEER_FORWARD_REQUEST::" + string(data)))
+							if err != nil {
+								log.Println("Error sending data to", ip+":"+port)
+								hasErrorOccurred = true
+								break
+							}
+							log.Println("Waiting for response from", ip+":"+port)
+							raw, _ := bufio.NewReader(conn).ReadString('\n')
+							message := strings.Split(raw, "\n")[0]
+							log.Println("Response from", ip+":"+port, ":", message)
+						}
+						if hasErrorOccurred {
+							responseObj := map[string]interface{}{
+								"error":   true,
+								"message": "Error connecting to nodes",
+							}
+							json, _ := json.Marshal(responseObj)
+							newReq := goproxy.NewResponse(req,
+								goproxy.ContentTypeText,
+								500,
+								string(json),
+							)
+							newReq.Header.Set("Content-Type", "application/json")
+							newReq.Header.Set("Access-Control-Allow-Origin", "*")
+							return req, newReq
+						}
 					} else {
 						log.Println("Invalid domain, dropping request")
 						responseObj := map[string]interface{}{
@@ -665,6 +709,54 @@ func handleConn(conn net.Conn) {
 				log.Println(nodeIP + " requested nodes")
 				nodes, _ := json.Marshal(nodesList)
 				io.WriteString(conn, string(nodes)+"\n")
+			} else if strings.Split(temp, "::")[0] == "PEER_FORWARD_REQUEST" {
+				log.Println("Processing a peer forward request")
+				var data string = strings.Split(temp, "::")[1]
+				log.Println("DATA:", data)
+				// load json into a CruxNetworkPacket
+				var packet CruxNetworkPacket
+				err := json.Unmarshal([]byte(data), &packet)
+				if err != nil {
+					log.Println("Could not unmarshal packet:", err)
+					io.WriteString(conn, "CruxNetworkPacketFailedToParse\n")
+					return
+				}
+				var pubKey *rsa.PublicKey
+				pubKey, err = ParseRsaPublicKeyFromPemStr(packet.SenderPubkey)
+				if err != nil {
+					log.Println("Could not parse public key:", err)
+					io.WriteString(conn, "CruxNetworkPacketFailedToParse\n")
+					return
+				}
+				// log.Println(pubKey.N.String())
+				// verify signature of packet.KeySignature PKCS1v15
+				KeyHash32 := sha256.Sum256(packet.Key)
+				KeyHash := KeyHash32[:]
+				err = rsa.VerifyPKCS1v15(pubKey, crypto.SHA256, KeyHash, []byte(packet.KeySignature))
+				if err != nil {
+					log.Println("Could not verify key signature:", err)
+					io.WriteString(conn, "CruxNetworkPacketFailedToParse\n")
+					return
+				}
+				log.Println("Key signature verified")
+				err = rsa.VerifyPKCS1v15(pubKey, crypto.SHA256, []byte(packet.Hash), []byte(packet.DHashSignature))
+				if err != nil {
+					log.Println("Could not verify datahash signature:", err)
+					io.WriteString(conn, "CruxNetworkPacketFailedToParse\n")
+					return
+				}
+				log.Println("Data hash signature verified")
+				// decrypt packet.Key with private key
+				decryptedKey, err := rsa.DecryptOAEP(sha256.New(), rand.Reader, privateKey, packet.Key, nil)
+				if err != nil {
+					log.Println("Could not decrypt key:", err)
+					io.WriteString(conn, "CruxNetworkPacketFailedToParse\n")
+					return
+				}
+				log.Println("Data encryption key decrypted")
+				// decrypt packet.Data with decrypted key gcm.Seal
+				decryptedData := DecryptGCMCipher(packet.Data, decryptedKey, packet.Nonce)
+				log.Println("Data decrypted:", string(decryptedData))
 			}
 		}
 	} else {
@@ -673,6 +765,8 @@ func handleConn(conn net.Conn) {
 		return
 	}
 }
+
+var originalNodeRegisteredInBrowserMode bool = false
 
 func fetchAllPeers(addr string) {
 	c, err := getConn(addr)
@@ -691,6 +785,23 @@ func fetchAllPeers(addr string) {
 				return
 			}
 			log.Println("Connected to node at " + nodeIP)
+
+			if !originalNodeRegisteredInBrowserMode {
+				fmt.Fprintf(c, "GET_PUBKEY\n")
+				raw, _ := bufio.NewReader(c).ReadString('\n')
+				message := strings.Split(raw, "\n")[0]
+				hasher := sha256.New()
+				hasher.Write([]byte(strings.ReplaceAll(message, "NEWLINEBREAK", "\n")))
+				viewPK := hex.EncodeToString(hasher.Sum(nil))
+				nodesList[viewPK] = map[string]interface{}{
+					"IP":     strings.Split(originAddr, ":")[0],
+					"PORT":   strings.Split(originAddr, ":")[1],
+					"PUBKEY": strings.ReplaceAll(message, "NEWLINEBREAK", "\n"),
+				}
+				log.Println("Registered initial node at " + nodeIP)
+				originalNodeRegisteredInBrowserMode = true
+			}
+
 			fmt.Fprintf(c, "GET_NODES\n")
 			raw, _ := bufio.NewReader(c).ReadString('\n')
 			message := strings.Split(raw, "\n")[0]

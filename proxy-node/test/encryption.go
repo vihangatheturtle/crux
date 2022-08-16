@@ -19,6 +19,26 @@ type CruxNetworkPacket struct {
 	DHashSignature []byte
 	KeySignature   []byte
 	SenderPubkey   string
+	Nonce          []byte
+}
+
+func DecryptGCMCipher(ciphertext []byte, key []byte, nonce []byte) []byte {
+	// Create a new cipher using the key
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		panic(err)
+	}
+	// Create a new GCM cipher
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		panic(err)
+	}
+	// Decrypt the ciphertext
+	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		panic(err)
+	}
+	return plaintext
 }
 
 func CreateCruxNetworkPacket(pub *rsa.PublicKey, priv *rsa.PrivateKey, inputData []byte, meth string) CruxNetworkPacket {
@@ -46,7 +66,7 @@ func CreateCruxNetworkPacket(pub *rsa.PublicKey, priv *rsa.PrivateKey, inputData
 		panic(err)
 	}
 	// Create a new ciphertext
-	ciphertext := gcm.Seal(nonce, nonce, inputData, nil)
+	ciphertext := gcm.Seal(nil, nonce, inputData, nil)
 	// Encrypt the key with the public key
 	encryptedKey, err := rsa.EncryptOAEP(sha256.New(), rand.Reader, pub, key, nil)
 	if err != nil {
@@ -68,6 +88,7 @@ func CreateCruxNetworkPacket(pub *rsa.PublicKey, priv *rsa.PrivateKey, inputData
 	if err != nil {
 		panic(err)
 	}
+	pempub, _ := ExportRsaPublicKeyAsPemStr(&priv.PublicKey)
 	packet := CruxNetworkPacket{
 		Version:        1,
 		Method:         meth,
@@ -76,7 +97,8 @@ func CreateCruxNetworkPacket(pub *rsa.PublicKey, priv *rsa.PrivateKey, inputData
 		Hash:           dataHash,
 		DHashSignature: DHashSignature,
 		KeySignature:   KeySignature,
-		SenderPubkey:   priv.PublicKey.N.String(),
+		SenderPubkey:   pempub,
+		Nonce:          nonce,
 	}
 	return packet
 }
